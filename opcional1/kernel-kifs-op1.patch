@@ -1,0 +1,99 @@
+diff -Nur linux-2.6.39.4.kifs/include/linux/kifs.h linux-2.6.39.4.kifs-op1/include/linux/kifs.h
+--- linux-2.6.39.4.kifs/include/linux/kifs.h	2013-11-13 21:06:40.670385628 +0100
++++ linux-2.6.39.4.kifs-op1/include/linux/kifs.h	2013-11-13 21:07:38.266384924 +0100
+@@ -3,6 +3,7 @@
+ #include <linux/list.h> /* list_head */
+ 
+ #define MAX_KIFS_ENTRY_NAME_SIZE 50 
++#define MAX_KIFS_DESC_FILE_SIZE 100U
+ #define MAX_KIFS_ENTRY_NAME_SIZE_STR "50" 
+ 
+ /* Callback prototypes for kifs entries */
+@@ -14,6 +15,7 @@
+ typedef struct 
+ {
+ 	char entryname[MAX_KIFS_ENTRY_NAME_SIZE];
++    char descfile[MAX_KIFS_DESC_FILE_SIZE];
+ 	read_kifs_t *read_kifs;
+ 	write_kifs_t *write_kifs;
+ 	void *data;
+@@ -23,6 +25,7 @@
+ enum {
+ 	KIFS_READ_OP=0,
+ 	KIFS_WRITE_OP,
++    KIFS_DESC_OP,
+ 	KIFS_NR_OPS};
+ 
+ 
+@@ -34,7 +37,8 @@
+ kifs_entry_t* create_kifs_entry(const char* entryname,
+ 				read_kifs_t *read_kifs, 
+ 				write_kifs_t *write_kifs, 
+-				void* data);
++				void* data,
++				const char* descfile);
+ 
+ 
+ /* Remove kifs entry
+diff -Nur linux-2.6.39.4.kifs/kernel/kifs.c linux-2.6.39.4.kifs-op1/kernel/kifs.c
+--- linux-2.6.39.4.kifs/kernel/kifs.c	2013-11-13 21:06:40.670385628 +0100
++++ linux-2.6.39.4.kifs-op1/kernel/kifs.c	2013-11-13 21:07:38.266384924 +0100
+@@ -84,8 +84,20 @@
+ 		list_add(&(entry_buff[i].links),&free_list);
+ 	}
+ 
+-	create_kifs_entry("list",list_kifs,NULL,NULL);
+-	create_kifs_entry("clipboard",clipboard_kifs_read,clipboard_kifs_write,NULL);
++	create_kifs_entry("list",list_kifs,NULL,NULL,"List all KIFS entries.");
++	create_kifs_entry("clipboard",clipboard_kifs_read,clipboard_kifs_write,NULL,"Implements KIFS Clipboard.");
++}
++
++int read_kifs_desc(kifs_entry_t *elem, char __user *buffer, unsigned int max){
++    unsigned int min = min(max, MAX_KIFS_DESC_FILE_SIZE);
++    if(elem->descfile != NULL)
++    // Damos por supuesto que descfile termina en '\0'
++        return min - copy_to_user(buffer, elem->descfile, min);
++    else{
++        copy_to_user(buffer,0,1);
++        return 0;
++    }
++        
+ }
+ 
+ 
+@@ -109,6 +121,8 @@
+                         return -EPERM;
+                     
+                     return elem->write_kifs(buffer,maxchars,elem->data);    
++                case KIFS_DESC_OP:
++                    return read_kifs_desc(elem, buffer, maxchars);
+                 default:
+                     return -EINVAL;
+             }
+@@ -120,7 +134,7 @@
+ 
+ 
+ 
+-kifs_entry_t* create_kifs_entry(const char *entryname, read_kifs_t *read_kifs, write_kifs_t *write_kifs, void* data){
++kifs_entry_t* create_kifs_entry(const char *entryname, read_kifs_t *read_kifs, write_kifs_t *write_kifs, void* data, const char *descfile){
+ 	kifs_entry_t *ret;
+ 
+ 	if(list_empty(&free_list)){
+@@ -141,11 +155,15 @@
+ 
+ 	ret->read_kifs = read_kifs;
+ 	ret->write_kifs = write_kifs;
+-   ret->data = data;
++    ret->data = data;
+ 	memset(ret->entryname,0,MAX_KIFS_ENTRY_NAME_SIZE);
+ 	
+ 	strncpy(ret->entryname, entryname, MAX_KIFS_ENTRY_NAME_SIZE);
+-	
++	strncpy(ret->descfile, descfile, MAX_KIFS_DESC_FILE_SIZE);
++
++    ret->entryname[MAX_KIFS_ENTRY_NAME_SIZE-1] = '\0';
++    ret->descfile[MAX_KIFS_DESC_FILE_SIZE-1] = '\0';
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(create_kifs_entry);

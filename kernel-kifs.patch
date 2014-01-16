@@ -1,0 +1,302 @@
+diff -Nur linux-2.6.39.4.old/arch/x86/include/asm/unistd_32.h linux-2.6.39.4.kifs/arch/x86/include/asm/unistd_32.h
+--- linux-2.6.39.4.old/arch/x86/include/asm/unistd_32.h	2011-08-03 21:43:28.000000000 +0200
++++ linux-2.6.39.4.kifs/arch/x86/include/asm/unistd_32.h	2013-11-13 21:06:40.666385628 +0100
+@@ -350,10 +350,11 @@
+ #define __NR_open_by_handle_at  342
+ #define __NR_clock_adjtime	343
+ #define __NR_syncfs             344
++#define __NR_kifs		345
+ 
+ #ifdef __KERNEL__
+ 
+-#define NR_syscalls 345
++#define NR_syscalls 346
+ 
+ #define __ARCH_WANT_IPC_PARSE_VERSION
+ #define __ARCH_WANT_OLD_READDIR
+diff -Nur linux-2.6.39.4.old/arch/x86/kernel/syscall_table_32.S linux-2.6.39.4.kifs/arch/x86/kernel/syscall_table_32.S
+--- linux-2.6.39.4.old/arch/x86/kernel/syscall_table_32.S	2011-08-03 21:43:28.000000000 +0200
++++ linux-2.6.39.4.kifs/arch/x86/kernel/syscall_table_32.S	2013-11-13 21:06:40.666385628 +0100
+@@ -344,3 +344,4 @@
+ 	.long sys_open_by_handle_at
+ 	.long sys_clock_adjtime
+ 	.long sys_syncfs
++	.long sys_kifs			/* 345 */
+diff -Nur linux-2.6.39.4.old/include/linux/kifs.h linux-2.6.39.4.kifs/include/linux/kifs.h
+--- linux-2.6.39.4.old/include/linux/kifs.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-2.6.39.4.kifs/include/linux/kifs.h	2013-11-13 21:06:40.670385628 +0100
+@@ -0,0 +1,59 @@
++#ifndef KIFS_H
++#define KIFS_H
++#include <linux/list.h> /* list_head */
++
++#define MAX_KIFS_ENTRY_NAME_SIZE 50 
++#define MAX_KIFS_ENTRY_NAME_SIZE_STR "50" 
++
++/* Callback prototypes for kifs entries */
++typedef	int (read_kifs_t)(char *user_buffer, unsigned int maxchars, void *data);
++typedef	int (write_kifs_t)(const char *user_buffer, unsigned int maxchars, void *data);
++
++
++/* Descriptor interface for the entries */
++typedef struct 
++{
++	char entryname[MAX_KIFS_ENTRY_NAME_SIZE];
++	read_kifs_t *read_kifs;
++	write_kifs_t *write_kifs;
++	void *data;
++	struct list_head links;	/* Set of links in kifs */ 
++}kifs_entry_t;
++
++enum {
++	KIFS_READ_OP=0,
++	KIFS_WRITE_OP,
++	KIFS_NR_OPS};
++
++
++/* This fuction must ensure that no entry will be created as long as another entry with the same name already exists.
++ * == Return Value ==
++ * NULL Entry name already exists or No space is availables
++ * Pointer to the kifs entry
++ * */ 
++kifs_entry_t* create_kifs_entry(const char* entryname,
++				read_kifs_t *read_kifs, 
++				write_kifs_t *write_kifs, 
++				void* data);
++
++
++/* Remove kifs entry
++ * == Return Value ==
++ * -1 Entry does not exist
++ *  0 success
++ * */ 
++int remove_kifs_entry(const char* entry_name);
++
++/*  Implementation of kifs() system call
++ * == Return Value ==
++ * -EINVAL Unsupported operation (NULL callback) or Entry not exists
++ * -EFAULT Any other error (e.g: copy_from_user(), copy_to_user(),...)
++ * otherwise: Number of chars read/written (Usually maxchars value)
++ */
++asmlinkage long sys_kifs(const char* entry_name,unsigned int op_mode, char* user_buffer,unsigned int maxchars);
++
++/* KIFS's global initialization */
++void init_kifs_entry_set(void);
++
++
++#endif
+diff -Nur linux-2.6.39.4.old/kernel/kifs.c linux-2.6.39.4.kifs/kernel/kifs.c
+--- linux-2.6.39.4.old/kernel/kifs.c	1970-01-01 01:00:00.000000000 +0100
++++ linux-2.6.39.4.kifs/kernel/kifs.c	2013-11-13 21:06:40.670385628 +0100
+@@ -0,0 +1,167 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <asm/uaccess.h>
++#include <asm-generic/errno.h>
++#include <linux/list.h>
++#include <linux/kifs.h>
++
++#define __user
++#define KIFS_DEBUG
++#ifdef KIFS_DEBUG
++#define DBG(format, arg...) do { \
++		printk(KERN_DEBUG "%s: " format "\n" , __func__ , ## arg); \
++	} while (0)
++#else
++#define DBG(format, arg...) /* */
++#endif
++
++#define MAX_KIFS_ENTRY 10
++kifs_entry_t entry_buff[MAX_KIFS_ENTRY];
++
++#define CLIP_SIZE 50
++char clipboard[CLIP_SIZE];
++
++LIST_HEAD(entry_list);
++LIST_HEAD(free_list);
++
++int list_kifs (char __user *buffer, unsigned int maxchars, void *data){
++	kifs_entry_t *elem = NULL;
++	int used = 0;
++	int tot_used = 0;
++	char kbuff[MAX_KIFS_ENTRY_NAME_SIZE+1] = "";
++
++	DBG("[KIFS] evento listado");
++
++	list_for_each_entry(elem, &entry_list, links){
++        DBG("\t entry: %."MAX_KIFS_ENTRY_NAME_SIZE_STR"s\n", elem->entryname);
++		used = sprintf(kbuff, "%."MAX_KIFS_ENTRY_NAME_SIZE_STR"s\n", elem->entryname);
++		tot_used += used;
++		if(tot_used > maxchars){
++		    DBG("[KIFS] espacio insuficiente en buffer de usuario.");
++            return -ENOSPC;
++        }
++			
++		if(copy_to_user(buffer, kbuff, used)){
++            DBG("[KIFS] Error al copiar a buffer de usuario");
++			return -EFAULT;
++        }
++
++		buffer += used;
++	}
++	
++	copy_to_user(buffer-1, '\0', 1);
++
++	return tot_used;
++}
++
++int clipboard_kifs_read (char __user *buffer, unsigned int maxchars, void *data){
++	int used = 0;
++	if((used = strlen(clipboard)) <= maxchars){
++		used = used - copy_to_user(buffer, clipboard, used);
++	}else
++		return -ENOSPC;
++	return used;
++}
++
++int clipboard_kifs_write (const char __user *buffer, unsigned int maxchars, void *data){
++	int used = 0;
++	if(maxchars < CLIP_SIZE){
++		used = maxchars - copy_from_user(clipboard, buffer, maxchars);
++		clipboard[used] = '\0';
++	}else
++		return -ENOSPC;
++		
++	return used;
++}
++
++
++void init_kifs_entry_set(void){
++	int i;
++	memset(entry_buff,0,MAX_KIFS_ENTRY*sizeof(kifs_entry_t));
++	memset(clipboard, 0, CLIP_SIZE);
++
++	for(i=0; i<MAX_KIFS_ENTRY; i++){
++		list_add(&(entry_buff[i].links),&free_list);
++	}
++
++	create_kifs_entry("list",list_kifs,NULL,NULL);
++	create_kifs_entry("clipboard",clipboard_kifs_read,clipboard_kifs_write,NULL);
++}
++
++
++asmlinkage long sys_kifs(const char __user *entry_name, unsigned int op_mode, char __user *buffer, unsigned int maxchars){
++	kifs_entry_t *elem = NULL;
++	char kbuff[MAX_KIFS_ENTRY_NAME_SIZE];
++	memset(kbuff,0,MAX_KIFS_ENTRY_NAME_SIZE);
++	
++	strncpy_from_user(kbuff, entry_name, MAX_KIFS_ENTRY_NAME_SIZE);
++	
++	list_for_each_entry(elem, &entry_list, links){
++        if(strncmp(elem->entryname, kbuff, MAX_KIFS_ENTRY_NAME_SIZE) == 0){
++            switch(op_mode){
++                case KIFS_READ_OP:
++                    if(elem->read_kifs == NULL)
++                        return -EPERM;
++
++                    return elem->read_kifs(buffer,maxchars,elem->data);
++                case KIFS_WRITE_OP:
++                    if(elem->write_kifs == NULL)
++                        return -EPERM;
++                    
++                    return elem->write_kifs(buffer,maxchars,elem->data);    
++                default:
++                    return -EINVAL;
++            }
++        }
++	
++	}
++	return -EINVAL;
++}
++
++
++
++kifs_entry_t* create_kifs_entry(const char *entryname, read_kifs_t *read_kifs, write_kifs_t *write_kifs, void* data){
++	kifs_entry_t *ret;
++
++	if(list_empty(&free_list)){
++		DBG("[KIFS] Nos hemos quedado sin entradas :(");
++		return NULL;
++	}
++
++    list_for_each_entry(ret, &entry_list, links){
++        if(strncmp(ret->entryname, entryname, MAX_KIFS_ENTRY_NAME_SIZE) == 0)
++            return NULL; //La entrada ya existe
++    }
++
++    ret = NULL;
++	
++	list_move(free_list.next,&entry_list);
++	
++	ret = list_first_entry(&entry_list,kifs_entry_t,links);
++
++	ret->read_kifs = read_kifs;
++	ret->write_kifs = write_kifs;
++   ret->data = data;
++	memset(ret->entryname,0,MAX_KIFS_ENTRY_NAME_SIZE);
++	
++	strncpy(ret->entryname, entryname, MAX_KIFS_ENTRY_NAME_SIZE);
++	
++	return ret;
++}
++EXPORT_SYMBOL(create_kifs_entry);
++
++int remove_kifs_entry(const char* entry_name){
++	kifs_entry_t *ptr;
++	
++	list_for_each_entry(ptr,&entry_list,links){
++		if(strncmp(entry_name,ptr->entryname, MAX_KIFS_ENTRY_NAME_SIZE) == 0){
++			list_del(&(ptr->links));
++			list_add(&(ptr->links),&free_list);
++			return 0;
++		}
++	}
++	
++	return -EINVAL;
++}
++
++EXPORT_SYMBOL(remove_kifs_entry);
+diff -Nur linux-2.6.39.4.old/kernel/Makefile linux-2.6.39.4.kifs/kernel/Makefile
+--- linux-2.6.39.4.old/kernel/Makefile	2011-08-03 21:43:28.000000000 +0200
++++ linux-2.6.39.4.kifs/kernel/Makefile	2013-11-13 21:06:40.670385628 +0100
+@@ -10,7 +10,7 @@
+ 	    kthread.o wait.o kfifo.o sys_ni.o posix-cpu-timers.o mutex.o \
+ 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
+ 	    notifier.o ksysfs.o pm_qos_params.o sched_clock.o cred.o \
+-	    async.o range.o jump_label.o
++	    async.o range.o jump_label.o kifs.o
+ obj-y += groups.o
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+diff -Nur linux-2.6.39.4.old/kernel/sched.c linux-2.6.39.4.kifs/kernel/sched.c
+--- linux-2.6.39.4.old/kernel/sched.c	2011-08-03 21:43:28.000000000 +0200
++++ linux-2.6.39.4.kifs/kernel/sched.c	2013-11-13 21:06:40.674385628 +0100
+@@ -79,6 +79,7 @@
+ #include "sched_cpupri.h"
+ #include "workqueue_sched.h"
+ #include "sched_autogroup.h"
++#include <linux/kifs.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+@@ -8292,7 +8293,7 @@
+ 	if (cpu_isolated_map == NULL)
+ 		zalloc_cpumask_var(&cpu_isolated_map, GFP_NOWAIT);
+ #endif /* SMP */
+-
++	init_kifs_entry_set();
+ 	scheduler_running = 1;
+ }
+ 
+diff -Nur linux-2.6.39.4.old/Makefile linux-2.6.39.4.kifs/Makefile
+--- linux-2.6.39.4.old/Makefile	2011-08-03 21:43:28.000000000 +0200
++++ linux-2.6.39.4.kifs/Makefile	2013-11-13 21:06:40.678385628 +0100
+@@ -235,7 +235,7 @@
+ 	  else if [ -x /bin/bash ]; then echo /bin/bash; \
+ 	  else echo sh; fi ; fi)
+ 
+-HOSTCC       = gcc
++HOSTCC      ?= gcc
+ HOSTCXX      = g++
+ HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer
+ HOSTCXXFLAGS = -O2
